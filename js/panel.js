@@ -246,7 +246,7 @@
     aiLoginPollTimer = setInterval(async () => {
       if (!window.BiliSummary.deepseek) return;
       await window.BiliSummary.deepseek.checkLogin();
-      if (window.BiliSummary.deepseek.getState() === 'ready' || Date.now() - aiLoginPollStartTime > 30000) {
+      if (window.BiliSummary.deepseek.getState() === 'ready' || Date.now() - aiLoginPollStartTime > 120000) {
         stopAiLoginPoll();
         refreshAiStatusUI();
       }
@@ -259,6 +259,15 @@
       aiLoginPollTimer = null;
     }
   }
+
+  // 当用户从 DeepSeek 标签页登录完成切回 B站标签页时，自动快速检测一次登录态
+  window.addEventListener('focus', () => {
+    if (window.BiliSummary?.state?.panelVisible && (window.BiliSummary.state.settings?.aiChannel || 'browser') === 'browser') {
+      if (window.BiliSummary.deepseek && window.BiliSummary.deepseek.getState() !== 'ready') {
+        window.BiliSummary.deepseek.checkLogin().then(() => refreshAiStatusUI());
+      }
+    }
+  });
 
   function bindAiBrowserChannelEvents() {
     const ds = window.BiliSummary.deepseek;

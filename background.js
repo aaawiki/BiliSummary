@@ -974,11 +974,12 @@ async function dsExtractTokenFromTab(tabId) {
 async function dsCheckLogin() {
   await dsEnsureStorageLoaded();
   try {
-    // 第 1 步：优先从已有打开的 chat.deepseek.com 标签页直接读取 Token（最快、最准，不受 Edge Cookie 策略阻断）
+    // 第 1 步：优先从已有打开的 chat.deepseek.com 标签页直接读取 Token（最快、最准，绝不影响前台）
     try {
       const existingTabs = await chrome.tabs.query({ url: '*://chat.deepseek.com/*' });
-      if (existingTabs.length > 0 && existingTabs[0].id) {
-        const token = await dsExtractTokenFromTab(existingTabs[0].id);
+      for (const tab of existingTabs) {
+        if (!tab.id) continue;
+        const token = await dsExtractTokenFromTab(tab.id);
         if (token) {
           dsUpdateAuthToken(token);
           return { loggedIn: true };
@@ -991,28 +992,13 @@ async function dsCheckLogin() {
       return { loggedIn: true };
     }
 
-    // 第 3 步：多维度检索 DeepSeek Cookies（兼容 Edge/Chrome 差异与 host-only cookies）
+    // 第 3 步：多维度只读检索 DeepSeek Cookies（用于辅助判断状态，绝对不能创建/关闭标签页！）
     const cookies = await dsGetCookies();
     const knownSessionCookies = ['ds_session_id', 'session_id', 'HWSID', 'userToken', 'token', 'auth_token'];
-    const hasSessionCookie = cookies.some(c => (knownSessionCookies.includes(c.name) || /session|auth|token|deepseek/i.test(c.name)) && c.value);
+    const hasSessionCookie = cookies.some(c => (knownSessionCookies.includes(c.name) || /session|auth|token/i.test(c.name)) && c.value);
 
-    // 完全没有任何相关 cookie 且未打开标签页 → 判定为未登录
-    if (!hasSessionCookie && cookies.length === 0) {
-      dsClearAuthToken();
-      return { loggedIn: false };
-    }
-
-    // 第 4 步：有 Cookie 特征 → 尝试调用 dsEnsureToken 提取 token（后台临时标签页）
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const token = await dsEnsureToken();
-      if (token) {
-        dsUpdateAuthToken(token);
-        return { loggedIn: true };
-      }
-    }
-
-    // 第 5 步：未能提取到 token
-    return { loggedIn: false, reason: 'token_not_found' };
+    // 未在已有标签页中找到 token 且无有效缓存，判定为未登录
+    return { loggedIn: false, reason: hasSessionCookie ? 'tab_not_ready' : 'not_logged_in' };
   } catch (e) {
     return { loggedIn: false, reason: String(e) };
   }
@@ -1498,12 +1484,25 @@ async function dsDirectSend(prompt, chatId, requestId, parentMessageId, mode) {
   console.log('[BiliSummary] dsDirectSend begin', { chatId, parentMessageId, mode, promptLen: prompt?.length });
 
   try {
-    // 1. 获取 token（清除缓存确保每次都是新 token）
-    dsAuthToken = null;
-    dsSettingsToken = null;
-    const token = await dsEnsureToken();
+    // 1. 获取 token（优先复用缓存与已打开的标签页）
+    await dsEnsureStorageLoaded();
+    let token = dsAuthToken;
     if (!token) {
-      forward({ type: 'ds-error', error: '未获取到 DeepSeek 认证 Token，请先登录 chat.deepseek.com' });
+      const existingTabs = await chrome.tabs.query({ url: '*://chat.deepseek.com/*' });
+      for (const tab of existingTabs) {
+        if (!tab.id) continue;
+        token = await dsExtractTokenFromTab(tab.id);
+        if (token) {
+          dsUpdateAuthToken(token);
+          break;
+        }
+      }
+    }
+    if (!token) {
+      token = await dsEnsureToken();
+    }
+    if (!token) {
+      forward({ type: 'ds-error', error: '未获取到 DeepSeek 认证 Token，请先在 Edge 中打开并登录 chat.deepseek.com' });
       return;
     }
     const settingsToken = await dsEnsureSettingsToken();
@@ -1537,6 +1536,11 @@ async function dsDirectSend(prompt, chatId, requestId, parentMessageId, mode) {
           body: JSON.stringify({}),
         });
         if (!res.ok) {
+          if (res.status === 401 || res.status === 403) {
+            dsClearAuthToken();
+            forward({ type: 'ds-error', error: 'DeepSeek 登录状态已失效，请重新登录 chat.deepseek.com' });
+            return;
+          }
           forward({ type: 'ds-error', error: `创建会话失败: HTTP ${res.status}` });
           return;
         }
@@ -1557,6 +1561,11 @@ async function dsDirectSend(prompt, chatId, requestId, parentMessageId, mode) {
         body: JSON.stringify({ target_path: '/api/v0/chat/completion' }),
       });
       if (!powRes.ok) {
+        if (powRes.status === 401 || powRes.status === 403) {
+          dsClearAuthToken();
+          forward({ type: 'ds-error', error: 'DeepSeek 登录状态已失效，请重新登录 chat.deepseek.com' });
+          return;
+        }
         forward({ type: 'ds-error', error: `获取 PoW 挑战失败: HTTP ${powRes.status}` });
         return;
       }
