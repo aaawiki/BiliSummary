@@ -33,20 +33,27 @@
   } catch {}
 
   async function checkLogin() {
+    if (!chrome.runtime?.id) {
+      return { loggedIn: false, reason: 'extension_context_invalidated' };
+    }
     return new Promise((resolve) => {
-      chrome.runtime.sendMessage({ type: 'ds-check-login' }, (result) => {
-        if (chrome.runtime.lastError) {
-          resolve({ loggedIn: false, reason: chrome.runtime.lastError.message });
-          return;
-        }
-        if (result?.loggedIn) {
-          setState('ready');
-          resolve(result);
-        } else {
-          setState('not_logged_in');
-          resolve(result || { loggedIn: false });
-        }
-      });
+      try {
+        chrome.runtime.sendMessage({ type: 'ds-check-login' }, (result) => {
+          if (chrome.runtime.lastError) {
+            resolve({ loggedIn: false, reason: chrome.runtime.lastError.message });
+            return;
+          }
+          if (result?.loggedIn) {
+            setState('ready');
+            resolve(result);
+          } else {
+            setState('not_logged_in');
+            resolve(result || { loggedIn: false });
+          }
+        });
+      } catch (err) {
+        resolve({ loggedIn: false, reason: err?.message || 'context_invalidated' });
+      }
     });
   }
 
@@ -67,15 +74,26 @@
     const requestId = crypto.randomUUID();
     activeRequestId = requestId;
 
-    chrome.runtime.sendMessage({
-      type: 'ds-send',
-      markdown,
-      prompt,
-      mode: effectiveMode,
-      chatId,
-      requestId,
-    });
-    console.log('[BiliSummary] ds-send sent', { requestId, chatId, mode: effectiveMode, promptLen: prompt?.length, markdownLen: markdown?.length });
+    try {
+      if (!chrome.runtime?.id) {
+        emit('error', '插件已重新加载，请刷新当前网页 (F5) 后重试');
+        setState('error');
+        return;
+      }
+      chrome.runtime.sendMessage({
+        type: 'ds-send',
+        markdown,
+        prompt,
+        mode: effectiveMode,
+        chatId,
+        requestId,
+      });
+      console.log('[BiliSummary] ds-send sent', { requestId, chatId, mode: effectiveMode, promptLen: prompt?.length, markdownLen: markdown?.length });
+    } catch (e) {
+      emit('error', '插件上下文失效，请刷新页面');
+      setState('error');
+      return;
+    }
 
     setTimeout(() => {
       if (state === 'reading' || state === 'responding') {
@@ -171,7 +189,9 @@
   }
 
   function abort() {
-    chrome.runtime.sendMessage({ type: 'ds-abort' });
+    try {
+      if (chrome.runtime?.id) chrome.runtime.sendMessage({ type: 'ds-abort' });
+    } catch {}
     activeRequestId = null;
     try { chrome.storage.local.remove('chatId'); } catch {}
     clear();
@@ -181,7 +201,13 @@
     if (state === 'reading' || state === 'responding') {
       try { window.BiliSummary.panel.showToast('总结中，已在新标签页后台打开'); } catch {}
     }
-    chrome.runtime.sendMessage({ type: 'ds-open-login' });
+    try {
+      if (!chrome.runtime?.id) {
+        try { window.BiliSummary.panel.showToast('插件已重新加载，请刷新当前页面 (F5)'); } catch {}
+        return;
+      }
+      chrome.runtime.sendMessage({ type: 'ds-open-login' });
+    } catch {}
   }
 
   BN.deepseek = {

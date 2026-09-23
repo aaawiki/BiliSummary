@@ -12,18 +12,25 @@
   // ── API 通信 ──
 
   async function fetchFromBg(type, params) {
+    if (!chrome.runtime?.id) {
+      throw new Error('插件已重新加载，请刷新当前 B 站视频页面 (F5) 后使用');
+    }
     return new Promise((resolve, reject) => {
-      chrome.runtime.sendMessage({ type, ...params }, resp => {
-        if (chrome.runtime.lastError) {
-          reject(new Error(chrome.runtime.lastError.message));
-          return;
-        }
-        if (!resp?.ok) {
-          reject(new Error(resp?.error || '请求失败'));
-          return;
-        }
-        resolve(resp.data);
-      });
+      try {
+        chrome.runtime.sendMessage({ type, ...params }, resp => {
+          if (chrome.runtime.lastError) {
+            reject(new Error(chrome.runtime.lastError.message));
+            return;
+          }
+          if (!resp?.ok) {
+            reject(new Error(resp?.error || '请求失败'));
+            return;
+          }
+          resolve(resp.data);
+        });
+      } catch (err) {
+        reject(new Error('插件已重新加载，请刷新页面 (F5)'));
+      }
     });
   }
 
