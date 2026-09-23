@@ -63,9 +63,18 @@ edge://extensions
    - 确认当前网页 URL 是否包含 `/video/BV...`、`/list/...` 或 `/bangumi/play/...`。
    - 刷新视频页面重试。
 
-2. **提示“DeepSeek 未登录”？**
-   - 请在 Edge 中打开 [chat.deepseek.com](https://chat.deepseek.com) 并确认已登录成功；
-   - 本次更新已修复 Edge 下跨域会话 Cookie 权限问题，如仍提示，请刷新 DeepSeek 标签页后再试。
+2. **提示“DeepSeek 未登录” 或 Edge 网页端无法登录 DeepSeek？**
+   - **方案 A（最常见：Edge 跟踪预防拦截）**：
+     Edge 默认启用了「平衡型跟踪预防」，可能会拦截 DeepSeek 登录时的 Cloudflare 验证码（Turnstile）或滑块验证。
+     - 在 Edge 中打开 [chat.deepseek.com](https://chat.deepseek.com)；
+     - 点击地址栏最左侧的 **「小锁」** 或 **「网站信息/盾牌」** 图标；
+     - 找到 **「跟踪预防」**（Tracking Prevention），将其开关切换为 **「关」**；
+     - 刷新页面后重新输入账号密码登录。
+   - **方案 B（保持标签页打开）**：
+     - 在 Edge 任意标签页打开并登录好 [chat.deepseek.com](https://chat.deepseek.com)，无需关闭该标签页；
+     - 插件已升级支持直接从当前已打开的 DeepSeek 标签页快速同步 Token，瞬间识别登录状态。
+   - **方案 C（关闭该站点睡眠）**：
+     - 访问 `edge://settings/system`，在「从不将这些站点置于睡眠状态」中添加 `chat.deepseek.com`，防止 Edge 在后台挂起会话导致断开。
 
 3. **Edge 重启后提示“请禁用开发人员模式扩展”？**
    - 这是 Chromium 浏览器的常规安全提示，点击右侧的关闭或“继续保持开启”即可，不会影响插件正常使用。

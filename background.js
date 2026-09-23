@@ -777,21 +777,36 @@ function dsUpdateLastMessageId(msgId) {
   chrome.storage.local.set({ dsLastMessageId: msgId }).catch(() => {});
 }
 
+// 持久化 DeepSeek 认证 Token
+function dsUpdateAuthToken(token) {
+  if (!token) return;
+  if (token === dsAuthToken) return;
+  dsAuthToken = token;
+  chrome.storage.local.set({ dsAuthToken: token }).catch(() => {});
+}
+
+function dsClearAuthToken() {
+  dsAuthToken = null;
+  chrome.storage.local.remove(['dsAuthToken']).catch(() => {});
+}
+
 // 加载持久化的会话状态
 let dsStorageLoaded = false;
 async function dsEnsureStorageLoaded() {
   if (dsStorageLoaded) return;
   try {
-    const stored = await chrome.storage.local.get(['chatId', 'dsLastMessageId']);
-    if (stored.chatId) dsChatId = stored.chatId;
-    if (stored.dsLastMessageId) dsLastMessageId = stored.dsLastMessageId;
+    const stored = await chrome.storage.local.get(['chatId', 'dsLastMessageId', 'dsAuthToken']);
+    if (stored?.chatId) dsChatId = stored.chatId;
+    if (stored?.dsLastMessageId) dsLastMessageId = stored.dsLastMessageId;
+    if (stored?.dsAuthToken) dsAuthToken = stored.dsAuthToken;
   } catch {}
   dsStorageLoaded = true;
 }
 // 启动时异步加载
-chrome.storage.local.get(['chatId', 'dsLastMessageId'], (stored) => {
-  if (stored.chatId) dsChatId = stored.chatId;
-  if (stored.dsLastMessageId) dsLastMessageId = stored.dsLastMessageId;
+chrome.storage.local.get(['chatId', 'dsLastMessageId', 'dsAuthToken'], (stored) => {
+  if (stored?.chatId) dsChatId = stored.chatId;
+  if (stored?.dsLastMessageId) dsLastMessageId = stored.dsLastMessageId;
+  if (stored?.dsAuthToken) dsAuthToken = stored.dsAuthToken;
   dsStorageLoaded = true;
 });
 
@@ -882,57 +897,121 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   }
 });
 
+// 多维度检索 DeepSeek Cookies（兼容 Edge 和 Chrome 的跨域与 host-only 特性）
+async function dsGetCookies() {
+  const all = [];
+  try {
+    const byUrl = await chrome.cookies.getAll({ url: 'https://chat.deepseek.com' });
+    if (byUrl?.length) all.push(...byUrl);
+  } catch {}
+  try {
+    const byDomain = await chrome.cookies.getAll({ domain: 'deepseek.com' });
+    if (byDomain?.length) all.push(...byDomain);
+  } catch {}
+  try {
+    const byDotDomain = await chrome.cookies.getAll({ domain: '.deepseek.com' });
+    if (byDotDomain?.length) all.push(...byDotDomain);
+  } catch {}
+  const map = new Map();
+  for (const c of all) {
+    map.set(`${c.name}:${c.domain}:${c.path}`, c);
+  }
+  return Array.from(map.values());
+}
+
+// 直接从指定的 DeepSeek 标签页提取登录 Token
+async function dsExtractTokenFromTab(tabId) {
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: () => {
+        function tryGetToken(raw) {
+          if (!raw || typeof raw !== 'string' || raw.length <= 10) return null;
+          try {
+            const parsed = JSON.parse(raw);
+            if (typeof parsed === 'string' && parsed.length > 10) return parsed;
+            if (typeof parsed === 'object' && parsed !== null) {
+              let t = parsed.token || parsed.access_token || parsed.jwt;
+              if (t && typeof t === 'string' && t.length > 10) return t;
+              if (parsed.value) {
+                if (typeof parsed.value === 'string' && parsed.value.length > 10) return parsed.value;
+                if (typeof parsed.value === 'object') {
+                  t = parsed.value.token || parsed.value.settingsToken || parsed.value.access_token;
+                  if (t && typeof t === 'string' && t.length > 10) return t;
+                }
+              }
+            }
+          } catch { return raw; }
+          return null;
+        }
+
+        const keys = ['userToken', 'token', 'ds_token', 'auth_token', 'access_token', 'jwt'];
+        for (const key of keys) {
+          try {
+            const t = tryGetToken(localStorage.getItem(key)) || tryGetToken(sessionStorage.getItem(key));
+            if (t) return t;
+          } catch {}
+        }
+        try {
+          for (let i = 0; i < localStorage.length; i++) {
+            const k = localStorage.key(i);
+            if (k && /token|auth|jwt|session/i.test(k)) {
+              const t = tryGetToken(localStorage.getItem(k));
+              if (t) return t;
+            }
+          }
+        } catch {}
+        return null;
+      },
+    });
+    return results?.[0]?.result || null;
+  } catch (err) {
+    return null;
+  }
+}
+
 async function dsCheckLogin() {
   await dsEnsureStorageLoaded();
   try {
-    // 第 1 步：快速 cookie 检测（无需创建标签页）
-    let cookies;
-    try { cookies = await chrome.cookies.getAll({ domain: '.deepseek.com' }); } catch { cookies = []; }
-    const hasSessionCookie = cookies.some(c => ['ds_session_id', 'session_id', 'HWSID'].includes(c.name) && c.value);
+    // 第 1 步：优先从已有打开的 chat.deepseek.com 标签页直接读取 Token（最快、最准，不受 Edge Cookie 策略阻断）
+    try {
+      const existingTabs = await chrome.tabs.query({ url: '*://chat.deepseek.com/*' });
+      if (existingTabs.length > 0 && existingTabs[0].id) {
+        const token = await dsExtractTokenFromTab(existingTabs[0].id);
+        if (token) {
+          dsUpdateAuthToken(token);
+          return { loggedIn: true };
+        }
+      }
+    } catch {}
 
-    if (!hasSessionCookie) {
-      dsAuthToken = null;
+    // 第 2 步：如果已有已加载的持久化 Token，直接视为已登录
+    if (dsAuthToken) {
+      return { loggedIn: true };
+    }
+
+    // 第 3 步：多维度检索 DeepSeek Cookies（兼容 Edge/Chrome 差异与 host-only cookies）
+    const cookies = await dsGetCookies();
+    const knownSessionCookies = ['ds_session_id', 'session_id', 'HWSID', 'userToken', 'token', 'auth_token'];
+    const hasSessionCookie = cookies.some(c => (knownSessionCookies.includes(c.name) || /session|auth|token|deepseek/i.test(c.name)) && c.value);
+
+    // 完全没有任何相关 cookie 且未打开标签页 → 判定为未登录
+    if (!hasSessionCookie && cookies.length === 0) {
+      dsClearAuthToken();
       return { loggedIn: false };
     }
 
-    // 第 2 步：有 cookie → 尝试提取 token
-    // 先尝试从已有标签页提取，失败则创建专用标签页重试
+    // 第 4 步：有 Cookie 特征 → 尝试调用 dsEnsureToken 提取 token（后台临时标签页）
     for (let attempt = 0; attempt < 3; attempt++) {
       const token = await dsEnsureToken();
       if (token) {
+        dsUpdateAuthToken(token);
         return { loggedIn: true };
-      }
-      // 已有标签页提取失败，创建专用标签页重试（给 SPA 足够时间恢复会话）
-      if (attempt === 0) {
-        const tab = await chrome.tabs.create({ url: DS_URL, active: false }).catch(() => null);
-        if (tab?.id) {
-          await dsWaitTabComplete(tab.id, 25000);
-          const results = await chrome.scripting.executeScript({
-            target: { tabId: tab.id }, world: 'MAIN',
-            func: () => {
-              const keys = ['userToken', 'token', 'ds_token', 'auth_token', 'access_token', 'jwt'];
-              for (const key of keys) {
-                try {
-                  const raw = localStorage.getItem(key);
-                  if (raw && typeof raw === 'string' && raw.length > 10) {
-                    try { const p = JSON.parse(raw); const t = p.token || p.value || p.access_token || p.jwt; if (t && typeof t === 'string' && t.length > 10) return t; } catch { return raw; }
-                  }
-                } catch {}
-              }
-              return null;
-            },
-          }).catch(() => ({ result: null }));
-          if (results?.[0]?.result) {
-            dsAuthToken = results[0].result;
-            chrome.tabs.remove(tab.id).catch(() => {});
-            return { loggedIn: true };
-          }
-          chrome.tabs.remove(tab.id).catch(() => {});
-        }
       }
     }
 
-    // 第 3 步：token 提取失败 → 未登录（无 token 无法认证 API 请求）
+    // 第 5 步：未能提取到 token
     return { loggedIn: false, reason: 'token_not_found' };
   } catch (e) {
     return { loggedIn: false, reason: String(e) };
@@ -1227,7 +1306,7 @@ async function dsEnsureToken() {
           const result = { token: null, settingsToken: null };
           const keys = ['userToken', 'token', 'ds_token', 'auth_token', 'access_token', 'jwt'];
           for (const key of keys) {
-            const t = tryGetToken(localStorage.getItem(key));
+            const t = tryGetToken(localStorage.getItem(key)) || tryGetToken(sessionStorage.getItem(key));
             if (t) { result.token = t; break; }
           }
           try {
@@ -1252,7 +1331,9 @@ async function dsEnsureToken() {
         },
       });
       const result = results?.[0]?.result || {};
-      if (result.token) dsAuthToken = result.token;
+      if (result.token) {
+        dsUpdateAuthToken(result.token);
+      }
       if (result.settingsToken) dsSettingsToken = result.settingsToken;
       if (dsAuthToken) break;
     } catch {}
